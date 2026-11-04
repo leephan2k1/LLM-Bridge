@@ -12,9 +12,13 @@ import type {
   TaskStatus,
 } from "../types.js";
 import { logger } from "../../observability/logger.js";
+import { HubEventBus, globalEventBus } from "../../events/event-bus.js";
 
 export class HubService {
-  constructor(private db: Database.Database) {}
+  constructor(
+    private db: Database.Database,
+    public eventBus: HubEventBus = globalEventBus
+  ) {}
 
   // -------------------------------------------------------------
   // Agent Management
@@ -462,6 +466,20 @@ export class HubService {
 
     transaction();
 
+    // Broadcast real-time event to all connected instances
+    this.eventBus.publish({
+      type: "new_message",
+      messageId,
+      sessionId: input.sessionId,
+      channelId: input.channelId,
+      threadId,
+      fromAgentId: input.fromAgentId,
+      toAgentIds: recipientIds,
+      messageType: input.messageType || "message",
+      content: input.content,
+      createdAt: now,
+    });
+
     logger.info("Message sent", {
       messageId,
       threadId,
@@ -475,6 +493,17 @@ export class HubService {
       createdAt: now,
       recipients: recipientIds,
     };
+  }
+
+  waitForMessage(
+    filter: {
+      agentId: string;
+      sessionId?: string;
+      threadId?: string;
+    },
+    timeoutMs: number = 30000
+  ) {
+    return this.eventBus.waitForMessage(filter, timeoutMs);
   }
 
   replyToMessage(input: {

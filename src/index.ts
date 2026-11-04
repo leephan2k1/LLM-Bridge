@@ -4,6 +4,7 @@ import { loadConfig } from "./config/index.js";
 import { initDatabase } from "./persistence/database.js";
 import { HubService } from "./domain/services/hub-service.js";
 import { createMcpServer } from "./server/create-server.js";
+import { globalEventBus } from "./events/event-bus.js";
 import { logger } from "./observability/logger.js";
 
 async function main() {
@@ -14,15 +15,18 @@ async function main() {
     dbPath: config.dbPath,
   });
 
+  await globalEventBus.start();
+
   const db = initDatabase(config.dbPath);
-  const hub = new HubService(db);
+  const hub = new HubService(db, globalEventBus);
   const server = createMcpServer(hub, config);
 
   const transport = new StdioServerTransport();
 
-  const shutdown = () => {
+  const shutdown = async () => {
     logger.info("Shutting down LLM Bridge MCP Server...");
     try {
+      await globalEventBus.stop();
       db.close();
     } catch {
       // ignore

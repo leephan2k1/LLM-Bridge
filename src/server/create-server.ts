@@ -1,13 +1,81 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { HubService } from "../domain/services/hub-service.js";
 import type { HubConfig } from "../config/index.js";
 import type { MessageType, TaskStatus } from "../domain/types.js";
+import { logger } from "../observability/logger.js";
 
 export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
-  const server = new McpServer({
-    name: config.serverName,
-    version: config.serverVersion,
+  const server = new McpServer(
+    {
+      name: config.serverName,
+      version: config.serverVersion,
+    },
+    {
+      capabilities: {
+        resources: { subscribe: true, listChanged: true },
+        tools: { listChanged: true },
+        prompts: { listChanged: true },
+      },
+    }
+  );
+
+  // -------------------------------------------------------------
+  // Resource Subscriptions & Real-Time Notifications
+  // -------------------------------------------------------------
+  const activeSubscriptions = new Set<string>();
+
+  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    activeSubscriptions.add(request.params.uri);
+    logger.info("Client subscribed to resource", { uri: request.params.uri });
+    return {};
+  });
+
+  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    activeSubscriptions.delete(request.params.uri);
+    logger.info("Client unsubscribed from resource", { uri: request.params.uri });
+    return {};
+  });
+
+  // Listen for real-time events published to the EventBus
+  hub.eventBus.on("event", async (event) => {
+    if (event.type !== "new_message") return;
+
+    logger.debug("Broadcasting MCP notifications for event", {
+      messageId: event.messageId,
+      threadId: event.threadId,
+    });
+
+    // 1. Notify resource updates for each recipient's inbox
+    for (const recipientId of event.toAgentIds) {
+      const inboxUri = `hub://inbox/${recipientId}`;
+      try {
+        await server.server.sendResourceUpdated({ uri: inboxUri });
+      } catch {
+        // ignore if client not currently listening
+      }
+    }
+
+    // 2. Notify resource updates for thread & session
+    const threadUri = `hub://threads/${event.threadId}`;
+    const sessionUri = `hub://sessions/${event.sessionId}`;
+    try {
+      await server.server.sendResourceUpdated({ uri: threadUri });
+      await server.server.sendResourceUpdated({ uri: sessionUri });
+    } catch {
+      // ignore
+    }
+
+    // 3. Emit custom real-time notification
+    try {
+      await server.server.notification({
+        method: "notifications/message_received",
+        params: event,
+      });
+    } catch {
+      // ignore
+    }
   });
 
   // -------------------------------------------------------------
@@ -207,11 +275,11 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
   );
 
   // -------------------------------------------------------------
-  // Tool: send_message
+  // Tool: send_message (with optional real-time reply waiting)
   // -------------------------------------------------------------
   server.tool(
     "send_message",
-    "Send a message to another agent or broadcast to a channel within a session",
+    "Send a message to another agent or channel. Supports real-time notifications and optional synchronous reply waiting.",
     {
       session_id: z.string().describe("Session identifier"),
       channel_id: z.string().describe("Channel identifier, e.g. 'general' or 'architecture-review'"),
@@ -225,6 +293,8 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
       content: z.string().describe("Content of the message (Markdown supported)"),
       metadata: z.record(z.string(), z.unknown()).optional().describe("Optional structured metadata"),
       idempotency_key: z.string().optional().describe("Unique client-generated key to prevent duplicate sends"),
+      wait_for_reply: z.boolean().optional().describe("If true, wait in real-time until a recipient replies to this thread"),
+      timeout_seconds: z.number().optional().describe("Timeout in seconds when wait_for_reply is true (default 30, max 120)"),
     },
     async (args) => {
       try {
@@ -239,6 +309,35 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
           metadata: args.metadata,
           idempotencyKey: args.idempotency_key,
         });
+
+        if (args.wait_for_reply) {
+          const timeoutMs = Math.min(Math.max((args.timeout_seconds || 30) * 1000, 1000), 120000);
+          const replyEvent = await hub.waitForMessage(
+            {
+              agentId: args.from_agent_id,
+              threadId: result.threadId,
+            },
+            timeoutMs
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    ...result,
+                    replyReceived: !!replyEvent,
+                    reply: replyEvent || null,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -283,6 +382,58 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
         return {
           isError: true,
           content: [{ type: "text", text: `Failed to reply to message: ${(err as Error).message}` }],
+        };
+      }
+    }
+  );
+
+  // -------------------------------------------------------------
+  // Tool: wait_for_message (Real-Time Long-Polling / Wakeup)
+  // -------------------------------------------------------------
+  server.tool(
+    "wait_for_message",
+    "Wait in real-time for an incoming message or reply (blocks until a message arrives or timeout)",
+    {
+      agent_id: z.string().describe("Agent ID waiting for incoming messages"),
+      session_id: z.string().optional().describe("Optional session ID filter"),
+      thread_id: z.string().optional().describe("Optional thread ID filter (e.g. waiting for a reply)"),
+      timeout_seconds: z.number().optional().describe("Maximum seconds to wait (1 to 120, default 30)"),
+    },
+    async (args) => {
+      try {
+        const timeoutMs = Math.min(Math.max((args.timeout_seconds || 30) * 1000, 1000), 120000);
+        const event = await hub.waitForMessage(
+          {
+            agentId: args.agent_id,
+            sessionId: args.session_id,
+            threadId: args.thread_id,
+          },
+          timeoutMs
+        );
+
+        if (!event) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ timedOut: true, message: "No message arrived within timeout" }),
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ timedOut: false, event }, null, 2),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Failed to wait for message: ${(err as Error).message}` }],
         };
       }
     }
@@ -461,7 +612,7 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
   );
 
   // -------------------------------------------------------------
-  // MCP Resources
+  // MCP Resources & Dynamic Resource Templates
   // -------------------------------------------------------------
   server.resource(
     "agents",
@@ -491,6 +642,42 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
             uri: "hub://sessions",
             mimeType: "application/json",
             text: JSON.stringify(sessions, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // Dynamic inbox resource for real-time subscription
+  server.resource(
+    "inbox",
+    new ResourceTemplate("hub://inbox/{agent_id}", { list: undefined }),
+    async (uri, { agent_id }) => {
+      const inbox = hub.readInbox({ agentId: agent_id as string, unreadOnly: true });
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(inbox, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // Dynamic thread resource for real-time subscription
+  server.resource(
+    "thread",
+    new ResourceTemplate("hub://threads/{thread_id}", { list: undefined }),
+    async (uri, { thread_id }) => {
+      const thread = hub.getThread(thread_id as string);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(thread, null, 2),
           },
         ],
       };
@@ -533,4 +720,3 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
 
   return server;
 }
-
