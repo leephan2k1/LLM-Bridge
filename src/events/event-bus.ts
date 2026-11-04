@@ -241,3 +241,4 @@ export class HubEventBus extends EventEmitter {
 }
 
 export const globalEventBus = new HubEventBus();
+
