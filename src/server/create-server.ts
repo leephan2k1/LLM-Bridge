@@ -533,3 +533,4 @@ export function createMcpServer(hub: HubService, config: HubConfig): McpServer {
 
   return server;
 }
+

@@ -41,3 +41,4 @@ main().catch((err) => {
   logger.error("Fatal error starting server", { error: (err as Error).message, stack: (err as Error).stack });
   process.exit(1);
 });
+

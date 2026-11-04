@@ -205,3 +205,4 @@ describe("E2E MCP Server Protocol Tests", () => {
     expect(promptResult.messages[0].content.type).toBe("text");
   });
 });
+

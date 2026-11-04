@@ -120,3 +120,4 @@ export function initDatabase(dbPath: string): Database.Database {
   logger.info("SQLite schema initialized successfully");
   return db;
 }
+

@@ -66,3 +66,4 @@ describe("Subprocess Stdio Protocol E2E", () => {
     expect(text).toContain("test-agent");
   });
 });
+

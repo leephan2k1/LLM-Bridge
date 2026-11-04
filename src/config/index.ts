@@ -21,3 +21,4 @@ export function loadConfig(): HubConfig {
     logLevel,
   };
 }
+
